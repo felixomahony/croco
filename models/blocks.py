@@ -198,30 +198,45 @@ class CrossAttention(nn.Module):
 
         self.rope = rope
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, return_attention=False):
+        # make everything reference based into a tuple
+        if not isinstance(key, tuple):
+            key = (key,)
+            value = (value,)
+            kpos = (kpos,)
+
+        n_references = len(key)
+
+        # we can assume all are the same size
         B, Nq, C = query.shape
-        Nk = key.shape[1]
-        Nv = value.shape[1]
+        Nk = key[0].shape[1]
+        Nv = value[0].shape[1]
 
         q = (
             self.projq(query)
             .reshape(B, Nq, self.num_heads, C // self.num_heads)
             .permute(0, 2, 1, 3)
         )
-        k = (
-            self.projk(key)
+        k = tuple(
+            self.projk(key[i])
             .reshape(B, Nk, self.num_heads, C // self.num_heads)
             .permute(0, 2, 1, 3)
+            for i in range(n_references)
         )
-        v = (
-            self.projv(value)
+        v = tuple(
+            self.projv(value[i])
             .reshape(B, Nv, self.num_heads, C // self.num_heads)
             .permute(0, 2, 1, 3)
+            for i in range(n_references)
         )
 
         if self.rope is not None:
             q = self.rope(q, qpos)
-            k = self.rope(k, kpos)
+            k = tuple(self.rope(k[i], kpos[i]) for i in range(n_references))
+
+        # now we want to stack k and v
+        k = torch.concat(k, dim=-2)
+        v = torch.concat(v, dim=-2)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -230,6 +245,9 @@ class CrossAttention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        if return_attention:
+            return x, attn
         return x
 
 
@@ -279,11 +297,43 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
+    def forward(self, x, y, xpos, ypos, return_attention=False):
+        method = "attention_weight"
+
+        if not isinstance(y, tuple):
+            y = (y,)
+            ypos = (ypos,)
         x = x + self.drop_path(self.attn(self.norm1(x), xpos))
-        y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
+        y_ = tuple(self.norm_y(y__) for y__ in y)
+
+        if method == "mean_mix":
+            x = x + self.drop_path(
+                sum(
+                    self.cross_attn(self.norm2(x), y_[i], y_[i], xpos, ypos[i])
+                    for i in range(len(y))
+                )
+                / len(y)
+            )
+        if method == "attention_weight":
+            dx = self.cross_attn(
+                self.norm2(x), y_, y_, xpos, ypos, return_attention=return_attention
+            )
+            if return_attention:
+                dx, attn = dx
+            x = x + self.drop_path(dx)  # the weighing is handled in the cross attention
+        if method == "laminate":
+            for i in range(len(y)):
+                x = x + self.drop_path(
+                    self.cross_attn(self.norm2(x), y_[i], y_[i], xpos, ypos[i])
+                )
+
         x = x + self.drop_path(self.mlp(self.norm3(x)))
+
+        if return_attention:
+            return (
+                x,
+                attn,
+            ), y
         return x, y
 
 
